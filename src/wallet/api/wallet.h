@@ -81,7 +81,7 @@ public:
                            const std::string &device_name);
     Device getDeviceType() const override;
     bool close(bool store = true);
-    std::string seed() const override;
+    std::string seed(const std::string& seed_offset = "") const override;
     std::string getSeedLanguage() const override;
     void setSeedLanguage(const std::string &arg) override;
     // void setListener(Listener *) {}
@@ -129,6 +129,7 @@ public:
     void setRecoveringFromDevice(bool recoveringFromDevice) override;
     void setSubaddressLookahead(uint32_t major, uint32_t minor) override;
     bool watchOnly() const override;
+    bool isDeterministic() const override;
     bool rescanSpent() override;
     NetworkType nettype() const override {return static_cast<NetworkType>(m_wallet->nettype());}
     void hardForkInfo(uint8_t &version, uint64_t &earliest_height) const override;
@@ -164,7 +165,7 @@ public:
     virtual PendingTransaction * createSweepUnmixableTransaction() override;
     bool submitTransaction(const std::string &fileName) override;
     virtual UnsignedTransaction * loadUnsignedTx(const std::string &unsigned_filename) override;
-    bool exportKeyImages(const std::string &filename) override;
+    bool exportKeyImages(const std::string &filename, bool all = false) override;
     bool importKeyImages(const std::string &filename) override;
 
     virtual void disposeTransaction(PendingTransaction * t) override;

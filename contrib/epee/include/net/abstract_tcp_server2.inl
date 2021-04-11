@@ -40,6 +40,7 @@
 #include <boost/date_time/posix_time/posix_time.hpp> // TODO
 #include <boost/thread/condition_variable.hpp> // TODO
 #include <boost/make_shared.hpp>
+#include <boost/thread.hpp>
 #include "warnings.h"
 #include "string_tools.h"
 #include "misc_language.h"
@@ -269,8 +270,6 @@ PRAGMA_WARNING_DISABLE_VS(4355)
     //_dbg3("[sock " << socket().native_handle() << "] add_ref, m_peer_number=" << mI->m_peer_number);
     CRITICAL_REGION_LOCAL(self->m_self_refs_lock);
     //_dbg3("[sock " << socket().native_handle() << "] add_ref 2, m_peer_number=" << mI->m_peer_number);
-    if(m_was_shutdown)
-      return false;
     ++m_reference_count;
     m_self_ref = std::move(self);
     return true;
@@ -562,7 +561,7 @@ PRAGMA_WARNING_DISABLE_VS(4355)
 			{ // LOCK: chunking
     		epee::critical_region_t<decltype(m_chunking_lock)> send_guard(m_chunking_lock); // *** critical *** 
 
-				MDEBUG("do_send() will SPLIT into small chunks, from packet="<<message_size<<" B for ptr="<<message_data);
+				MDEBUG("do_send() will SPLIT into small chunks, from packet="<<message_size<<" B for ptr="<<(const void*)message_data);
 				// 01234567890 
 				// ^^^^        (pos=0, len=4)     ;   pos:=pos+len, pos=4
 				//     ^^^^    (pos=4, len=4)     ;   pos:=pos+len, pos=8
@@ -575,14 +574,14 @@ PRAGMA_WARNING_DISABLE_VS(4355)
 				while (!message.empty()) {
 					byte_slice chunk = message.take_slice(chunksize_good);
 
-					MDEBUG("chunk_start="<<(void*)chunk.data()<<" ptr="<<message_data<<" pos="<<(chunk.data() - message_data));
+					MDEBUG("chunk_start="<<(void*)chunk.data()<<" ptr="<<(const void*)message_data<<" pos="<<(chunk.data() - message_data));
 					MDEBUG("part of " << message.size() << ": pos="<<(chunk.data() - message_data) << " len="<<chunk.size());
 
 					bool ok = do_send_chunk(std::move(chunk)); // <====== ***
 
 					all_ok = all_ok && ok;
 					if (!all_ok) {
-						MDEBUG("do_send() DONE ***FAILED*** from packet="<<message_size<<" B for ptr="<<message_data);
+						MDEBUG("do_send() DONE ***FAILED*** from packet="<<message_size<<" B for ptr="<<(const void*)message_data);
 						MDEBUG("do_send() SEND was aborted in middle of big package - this is mostly harmless "
 							<< " (e.g. peer closed connection) but if it causes trouble tell us at #monero-dev. " << message_size);
 						return false; // partial failure in sending
@@ -590,7 +589,7 @@ PRAGMA_WARNING_DISABLE_VS(4355)
 					// (in catch block, or uniq pointer) delete buf;
 				} // each chunk
 
-				MDEBUG("do_send() DONE SPLIT from packet="<<message_size<<" B for ptr="<<message_data);
+				MDEBUG("do_send() DONE SPLIT from packet="<<message_size<<" B for ptr="<<(const void*)message_data);
 
                 MDEBUG("do_send() m_connection_type = " << m_connection_type);
 

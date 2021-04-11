@@ -131,6 +131,7 @@ namespace nodetool
     command_line::add_arg(desc, arg_limit_rate_down);
     command_line::add_arg(desc, arg_limit_rate);
     command_line::add_arg(desc, arg_pad_transactions);
+    command_line::add_arg(desc, arg_max_connections_per_ip);
   }
   //-----------------------------------------------------------------------------------
   template<class t_payload_net_handler>
@@ -615,6 +616,8 @@ namespace nodetool
         return false;
     }
 
+    max_connections = command_line::get_arg(vm, arg_max_connections_per_ip);
+
     return true;
   }
   //-----------------------------------------------------------------------------------
@@ -894,32 +897,6 @@ namespace nodetool
     for(const auto& p: m_command_line_peers)
       m_network_zones.at(p.adr.get_zone()).m_peerlist.append_with_peer_white(p);
 
-// all peers are now setup
-#ifdef CRYPTONOTE_PRUNING_DEBUG_SPOOF_SEED
-    for (auto& zone : m_network_zones)
-    {
-      std::list<peerlist_entry> plw;
-      while (zone.second.m_peerlist.get_white_peers_count())
-      {
-        plw.push_back(peerlist_entry());
-        zone.second.m_peerlist.get_white_peer_by_index(plw.back(), 0);
-        zone.second.m_peerlist.remove_from_peer_white(plw.back());
-      }
-      for (auto &e:plw)
-        zone.second.m_peerlist.append_with_peer_white(e);
-
-      std::list<peerlist_entry> plg;
-      while (zone.second.m_peerlist.get_gray_peers_count())
-      {
-        plg.push_back(peerlist_entry());
-        zone.second.m_peerlist.get_gray_peer_by_index(plg.back(), 0);
-        zone.second.m_peerlist.remove_from_peer_gray(plg.back());
-      }
-      for (auto &e:plg)
-        zone.second.m_peerlist.append_with_peer_gray(e);
-    }
-#endif
-
     //only in case if we really sure that we have external visible ip
     m_have_address = true;
 
@@ -1162,6 +1139,7 @@ namespace nodetool
         pi = context.peer_id = rsp.node_data.peer_id;
         context.m_rpc_port = rsp.node_data.rpc_port;
         context.m_rpc_credits_per_hash = rsp.node_data.rpc_credits_per_hash;
+        context.support_flags = rsp.node_data.support_flags;
         const auto azone = context.m_remote_address.get_zone();
         network_zone& zone = m_network_zones.at(azone);
         zone.m_peerlist.set_peer_just_seen(rsp.node_data.peer_id, context.m_remote_address, context.m_pruning_seed, context.m_rpc_port, context.m_rpc_credits_per_hash);
@@ -1195,10 +1173,11 @@ namespace nodetool
     }
     else if (!just_take_peerlist)
     {
-      try_get_support_flags(context_, [](p2p_connection_context& flags_context, const uint32_t& support_flags) 
-      {
-        flags_context.support_flags = support_flags;
-      });
+      if (context_.support_flags == 0)
+        try_get_support_flags(context_, [](p2p_connection_context& flags_context, const uint32_t& support_flags) 
+        {
+          flags_context.support_flags = support_flags;
+        });
     }
 
     return hsh_result;
@@ -1224,9 +1203,8 @@ namespace nodetool
       if(!handle_remote_peerlist(rsp.local_peerlist_new, context))
       {
         LOG_WARNING_CC(context, "COMMAND_TIMED_SYNC: failed to handle_remote_peerlist(...), closing connection.");
-        const auto remote_address = context.m_remote_address;
         m_network_zones.at(context.m_remote_address.get_zone()).m_net_server.get_config_object().close(context.m_connection_id );
-        add_host_fail(remote_address);
+        add_host_fail(context.m_remote_address);
       }
       if(!context.m_is_income)
         m_network_zones.at(context.m_remote_address.get_zone()).m_peerlist.set_peer_just_seen(context.peer_id, context.m_remote_address, context.m_pruning_seed, context.m_rpc_port, context.m_rpc_credits_per_hash);
@@ -1390,7 +1368,7 @@ namespace nodetool
     if(just_take_peerlist)
     {
       zone.m_net_server.get_config_object().close(con->m_connection_id);
-      MDEBUG(na.str() << "CONNECTION HANDSHAKED OK AND CLOSED.");
+      LOG_DEBUG_CC(*con, "CONNECTION HANDSHAKED OK AND CLOSED.");
       return true;
     }
 
@@ -1452,7 +1430,7 @@ namespace nodetool
 
     zone.m_net_server.get_config_object().close(con->m_connection_id);
 
-    MDEBUG(na.str() << "CONNECTION HANDSHAKED OK AND CLOSED.");
+    LOG_DEBUG_CC(*con, "CONNECTION HANDSHAKED OK AND CLOSED.");
 
     return true;
   }
@@ -2022,15 +2000,24 @@ namespace nodetool
       boost::split(ips, record, boost::is_any_of(";"));
       for (const auto &ip: ips)
       {
-        const expect<epee::net_utils::network_address> parsed_addr = net::get_network_address(ip, 0);
-        if (!parsed_addr)
+        if (ip.empty())
+          continue;
+        auto subnet = net::get_ipv4_subnet_address(ip);
+        if (subnet)
         {
-          MWARNING("Invalid IP address from DNS blocklist: " << ip << " - " << parsed_addr.error());
-          ++bad;
+          block_subnet(*subnet, DNS_BLOCKLIST_LIFETIME);
+          ++good;
           continue;
         }
-        block_host(*parsed_addr, DNS_BLOCKLIST_LIFETIME, true);
-        ++good;
+        const expect<epee::net_utils::network_address> parsed_addr = net::get_network_address(ip, 0);
+        if (parsed_addr)
+        {
+          block_host(*parsed_addr, DNS_BLOCKLIST_LIFETIME, true);
+          ++good;
+          continue;
+        }
+        MWARNING("Invalid IP address or subnet from DNS blocklist: " << ip << " - " << parsed_addr.error());
+        ++bad;
       }
     }
     if (good > 0)
@@ -2125,10 +2112,6 @@ namespace nodetool
         continue;
       }
       local_peerlist[i].last_seen = 0;
-
-#ifdef CRYPTONOTE_PRUNING_DEBUG_SPOOF_SEED
-      be.pruning_seed = tools::make_pruning_seed(1 + (be.adr.as<epee::net_utils::ipv4_network_address>().ip()) % (1ul << CRYPTONOTE_PRUNING_LOG_STRIPES), CRYPTONOTE_PRUNING_LOG_STRIPES);
-#endif
     }
     return true;
   }
@@ -2174,6 +2157,7 @@ namespace nodetool
     node_data.rpc_port = zone.m_can_pingback ? m_rpc_port : 0;
     node_data.rpc_credits_per_hash = zone.m_can_pingback ? m_rpc_credits_per_hash : 0;
     node_data.network_id = m_network_id;
+    node_data.support_flags = zone.m_config.m_support_flags;
     return true;
   }
   //-----------------------------------------------------------------------------------
@@ -2480,14 +2464,12 @@ namespace nodetool
   template<class t_payload_net_handler>
   int node_server<t_payload_net_handler>::handle_handshake(int command, typename COMMAND_HANDSHAKE::request& arg, typename COMMAND_HANDSHAKE::response& rsp, p2p_connection_context& context)
   {
-    // copy since dropping the connection will invalidate the context, and thus the address
-    const auto remote_address = context.m_remote_address;
-
     if(arg.node_data.network_id != m_network_id)
     {
+
       LOG_INFO_CC(context, "WRONG NETWORK AGENT CONNECTED! id=" << arg.node_data.network_id);
       drop_connection(context);
-      add_host_fail(remote_address);
+      add_host_fail(context.m_remote_address);
       return 1;
     }
 
@@ -2495,7 +2477,7 @@ namespace nodetool
     {
       LOG_WARNING_CC(context, "COMMAND_HANDSHAKE came not from incoming connection");
       drop_connection(context);
-      add_host_fail(remote_address);
+      add_host_fail(context.m_remote_address);
       return 1;
     }
 
@@ -2544,6 +2526,7 @@ namespace nodetool
     context.m_in_timedsync = false;
     context.m_rpc_port = arg.node_data.rpc_port;
     context.m_rpc_credits_per_hash = arg.node_data.rpc_credits_per_hash;
+    context.support_flags = arg.node_data.support_flags;
 
     if(arg.node_data.my_port && zone.m_can_pingback)
     {
@@ -2577,10 +2560,11 @@ namespace nodetool
       });
     }
     
-    try_get_support_flags(context, [](p2p_connection_context& flags_context, const uint32_t& support_flags) 
-    {
-      flags_context.support_flags = support_flags;
-    });
+    if (context.support_flags == 0)
+      try_get_support_flags(context, [](p2p_connection_context& flags_context, const uint32_t& support_flags) 
+      {
+        flags_context.support_flags = support_flags;
+      });
 
     //fill response
     zone.m_peerlist.get_peerlist_head(rsp.local_peerlist_new, true);
@@ -2846,8 +2830,7 @@ namespace nodetool
     if (address.get_zone() != epee::net_utils::zone::public_)
       return false; // Unable to determine how many connections from host
 
-    const size_t max_connections = 1;
-    size_t count = 0;
+    uint32_t count = 0;
 
     m_network_zones.at(epee::net_utils::zone::public_).m_net_server.get_config_object().foreach_connection([&](const p2p_connection_context& cntxt)
     {

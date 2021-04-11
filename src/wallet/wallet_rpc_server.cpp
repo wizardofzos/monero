@@ -687,7 +687,7 @@ namespace tools
   {
     if (!m_wallet) return not_open(er);
     const std::pair<std::map<std::string, std::string>, std::vector<std::string>> account_tags = m_wallet->get_account_tags();
-    for (const std::pair<std::string, std::string>& p : account_tags.first)
+    for (const std::pair<const std::string, std::string>& p : account_tags.first)
     {
       res.account_tags.resize(res.account_tags.size() + 1);
       auto& info = res.account_tags.back();
@@ -1282,7 +1282,6 @@ namespace tools
             dests.erase(cd.change_dts.addr);
         }
 
-        size_t n_dummy_outputs = 0;
         for (auto i = dests.begin(); i != dests.end(); )
         {
           if (i->second.second > 0)
@@ -1888,6 +1887,7 @@ namespace tools
         rpc_transfers.tx_hash      = epee::string_tools::pod_to_hex(td.m_txid);
         rpc_transfers.subaddr_index = {td.m_subaddr_index.major, td.m_subaddr_index.minor};
         rpc_transfers.key_image    = td.m_key_image_known ? epee::string_tools::pod_to_hex(td.m_key_image) : "";
+        rpc_transfers.pubkey       = epee::string_tools::pod_to_hex(td.get_public_key());
         rpc_transfers.block_height = td.m_block_height;
         rpc_transfers.frozen       = td.m_frozen;
         rpc_transfers.unlocked     = m_wallet->is_transfer_unlocked(td);
@@ -2702,7 +2702,7 @@ namespace tools
     if (!m_wallet) return not_open(er);
     try
     {
-      std::pair<size_t, std::vector<std::pair<crypto::key_image, crypto::signature>>> ski = m_wallet->export_key_images(req.all);
+      std::pair<uint64_t, std::vector<std::pair<crypto::key_image, crypto::signature>>> ski = m_wallet->export_key_images(req.all);
       res.offset = ski.first;
       res.signed_key_images.resize(ski.second.size());
       for (size_t n = 0; n < ski.second.size(); ++n)
@@ -3014,6 +3014,41 @@ namespace tools
     return true;
   }
   //------------------------------------------------------------------------------------------------------------------------------
+  bool wallet_rpc_server::on_scan_tx(const wallet_rpc::COMMAND_RPC_SCAN_TX::request& req, wallet_rpc::COMMAND_RPC_SCAN_TX::response& res, epee::json_rpc::error& er, const connection_context *ctx)
+  {
+      if (!m_wallet) return not_open(er);
+      if (m_restricted)
+      {
+          er.code = WALLET_RPC_ERROR_CODE_DENIED;
+          er.message = "Command unavailable in restricted mode.";
+          return false;
+      }
+
+      std::vector<crypto::hash> txids;
+      std::list<std::string>::const_iterator i = req.txids.begin();
+      while (i != req.txids.end())
+      {
+          cryptonote::blobdata txid_blob;
+          if(!epee::string_tools::parse_hexstr_to_binbuff(*i++, txid_blob) || txid_blob.size() != sizeof(crypto::hash))
+          {
+              er.code = WALLET_RPC_ERROR_CODE_WRONG_TXID;
+              er.message = "TX ID has invalid format";
+              return false;
+          }
+
+          crypto::hash txid = *reinterpret_cast<const crypto::hash*>(txid_blob.data());
+          txids.push_back(txid);
+      }
+
+      try {
+          m_wallet->scan_tx(txids);
+      } catch (const std::exception &e) {
+          handle_rpc_exception(std::current_exception(), er, WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR);
+          return false;
+      }
+      return true;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
   bool wallet_rpc_server::on_rescan_spent(const wallet_rpc::COMMAND_RPC_RESCAN_SPENT::request& req, wallet_rpc::COMMAND_RPC_RESCAN_SPENT::response& res, epee::json_rpc::error& er, const connection_context *ctx)
   {
     if (!m_wallet) return not_open(er);
@@ -3119,17 +3154,7 @@ namespace tools
     }
     std::string wallet_file = req.filename.empty() ? "" : (m_wallet_dir + "/" + req.filename);
     {
-      std::vector<std::string> languages;
-      crypto::ElectrumWords::get_language_list(languages, false);
-      std::vector<std::string>::iterator it;
-
-      it = std::find(languages.begin(), languages.end(), req.language);
-      if (it == languages.end())
-      {
-        crypto::ElectrumWords::get_language_list(languages, true);
-        it = std::find(languages.begin(), languages.end(), req.language);
-      }
-      if (it == languages.end())
+      if (!crypto::ElectrumWords::is_valid_language(req.language))
       {
         er.code = WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR;
         er.message = "Unknown language: " + req.language;
@@ -3547,6 +3572,17 @@ namespace tools
       return false;
     }
 
+    if (!req.language.empty())
+    {
+      if (!crypto::ElectrumWords::is_valid_language(req.language))
+      {
+        er.code = WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR;
+        er.message = "The specified seed language is invalid.";
+        return false;
+      }
+      wal->set_seed_language(req.language);
+    }
+
     // set blockheight if given
     try
     {
@@ -3690,12 +3726,7 @@ namespace tools
         er.message = "Wallet was using the old seed language. You need to specify a new seed language.";
         return false;
       }
-      std::vector<std::string> language_list;
-      std::vector<std::string> language_list_en;
-      crypto::ElectrumWords::get_language_list(language_list);
-      crypto::ElectrumWords::get_language_list(language_list_en, true);
-      if (std::find(language_list.begin(), language_list.end(), req.language) == language_list.end() &&
-          std::find(language_list_en.begin(), language_list_en.end(), req.language) == language_list_en.end())
+      if (!crypto::ElectrumWords::is_valid_language(req.language))
       {
         er.code = WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR;
         er.message = "Wallet was using the old seed language, and the specified new seed language is invalid.";
@@ -4438,7 +4469,14 @@ public:
         wal->stop();
       });
 
-      wal->refresh(wal->is_trusted_daemon());
+      try
+      {
+        wal->refresh(wal->is_trusted_daemon());
+      }
+      catch (const std::exception& e)
+      {
+        LOG_ERROR(tools::wallet_rpc_server::tr("Initial refresh failed: ") << e.what());
+      }
       // if we ^C during potentially length load/refresh, there's no server loop yet
       if (quit)
       {

@@ -44,6 +44,7 @@ using namespace epee;
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_basic/account.h"
 #include "cryptonote_basic/cryptonote_basic_impl.h"
+#include "cryptonote_basic/merge_mining.h"
 #include "cryptonote_core/tx_sanity_check.h"
 #include "misc_language.h"
 #include "net/parse.h"
@@ -154,6 +155,7 @@ namespace cryptonote
     command_line::add_arg(desc, arg_restricted_rpc);
     command_line::add_arg(desc, arg_bootstrap_daemon_address);
     command_line::add_arg(desc, arg_bootstrap_daemon_login);
+    command_line::add_arg(desc, arg_bootstrap_daemon_proxy);
     cryptonote::rpc_args::init_options(desc, true);
     command_line::add_arg(desc, arg_rpc_payment_address);
     command_line::add_arg(desc, arg_rpc_payment_difficulty);
@@ -172,7 +174,10 @@ namespace cryptonote
     , m_rpc_payment_allow_free_loopback(false)
   {}
   //------------------------------------------------------------------------------------------------------------------------------
-  bool core_rpc_server::set_bootstrap_daemon(const std::string &address, const std::string &username_password)
+  bool core_rpc_server::set_bootstrap_daemon(
+    const std::string &address,
+    const std::string &username_password,
+    const std::string &proxy)
   {
     boost::optional<epee::net_utils::http::login> credentials;
     const auto loc = username_password.find(':');
@@ -180,7 +185,7 @@ namespace cryptonote
     {
       credentials = epee::net_utils::http::login(username_password.substr(0, loc), username_password.substr(loc + 1));
     }
-    return set_bootstrap_daemon(address, credentials);
+    return set_bootstrap_daemon(address, credentials, proxy);
   }
   //------------------------------------------------------------------------------------------------------------------------------
   std::map<std::string, bool> core_rpc_server::get_public_nodes(uint32_t credits_per_hash_threshold/* = 0*/)
@@ -217,7 +222,10 @@ namespace cryptonote
     return result;
   }
   //------------------------------------------------------------------------------------------------------------------------------
-  bool core_rpc_server::set_bootstrap_daemon(const std::string &address, const boost::optional<epee::net_utils::http::login> &credentials)
+  bool core_rpc_server::set_bootstrap_daemon(
+    const std::string &address,
+    const boost::optional<epee::net_utils::http::login> &credentials,
+    const std::string &proxy)
   {
     boost::unique_lock<boost::shared_mutex> lock(m_bootstrap_daemon_mutex);
 
@@ -233,11 +241,11 @@ namespace cryptonote
       auto get_nodes = [this]() {
         return get_public_nodes(credits_per_hash_threshold);
       };
-      m_bootstrap_daemon.reset(new bootstrap_daemon(std::move(get_nodes), rpc_payment_enabled));
+      m_bootstrap_daemon.reset(new bootstrap_daemon(std::move(get_nodes), rpc_payment_enabled, proxy));
     }
     else
     {
-      m_bootstrap_daemon.reset(new bootstrap_daemon(address, credentials, rpc_payment_enabled));
+      m_bootstrap_daemon.reset(new bootstrap_daemon(address, credentials, rpc_payment_enabled, proxy));
     }
 
     m_should_use_bootstrap_daemon = m_bootstrap_daemon.get() != nullptr;
@@ -278,6 +286,7 @@ namespace cryptonote
       }
     }
     disable_rpc_ban = rpc_config->disable_rpc_ban;
+    const std::string data_dir{command_line::get_arg(vm, cryptonote::arg_data_dir)};
     std::string address = command_line::get_arg(vm, arg_rpc_payment_address);
     if (!address.empty() && allow_rpc_payment)
     {
@@ -306,7 +315,7 @@ namespace cryptonote
       }
       m_rpc_payment_allow_free_loopback = command_line::get_arg(vm, arg_rpc_payment_allow_free_loopback);
       m_rpc_payment.reset(new rpc_payment(info.address, diff, credits));
-      m_rpc_payment->load(command_line::get_arg(vm, cryptonote::arg_data_dir));
+      m_rpc_payment->load(data_dir);
       m_p2p.set_rpc_credits_per_hash(RPC_CREDITS_PER_HASH_SCALE * (credits / (float)diff));
     }
 
@@ -318,8 +327,10 @@ namespace cryptonote
         MWARNING("The RPC server is accessible from the outside, but no RPC payment was setup. RPC access will be free for all.");
     }
 
-    if (!set_bootstrap_daemon(command_line::get_arg(vm, arg_bootstrap_daemon_address),
-      command_line::get_arg(vm, arg_bootstrap_daemon_login)))
+    if (!set_bootstrap_daemon(
+          command_line::get_arg(vm, arg_bootstrap_daemon_address),
+          command_line::get_arg(vm, arg_bootstrap_daemon_login),
+          command_line::get_arg(vm, arg_bootstrap_daemon_proxy)))
     {
       MFATAL("Failed to parse bootstrap daemon address");
       return false;
@@ -333,12 +344,32 @@ namespace cryptonote
     if (m_rpc_payment)
       m_net_server.add_idle_handler([this](){ return m_rpc_payment->on_idle(); }, 60 * 1000);
 
+    bool store_ssl_key = !restricted && rpc_config->ssl_options && rpc_config->ssl_options.auth.certificate_path.empty();
+    const auto ssl_base_path = (boost::filesystem::path{data_dir} / "rpc_ssl").string();
+    if (store_ssl_key && boost::filesystem::exists(ssl_base_path + ".crt"))
+    {
+      // load key from previous run, password prompted by OpenSSL
+      store_ssl_key = false;
+      rpc_config->ssl_options.auth =
+        epee::net_utils::ssl_authentication_t{ssl_base_path + ".key", ssl_base_path + ".crt"};
+    }
+
     auto rng = [](size_t len, uint8_t *ptr){ return crypto::rand(len, ptr); };
-    return epee::http_server_impl_base<core_rpc_server, connection_context>::init(
+    const bool inited = epee::http_server_impl_base<core_rpc_server, connection_context>::init(
       rng, std::move(port), std::move(bind_ip_str),
       std::move(bind_ipv6_str), std::move(rpc_config->use_ipv6), std::move(rpc_config->require_ipv4),
       std::move(rpc_config->access_control_origins), std::move(http_login), std::move(rpc_config->ssl_options)
     );
+
+    if (store_ssl_key && inited)
+    {
+      // new keys were generated, store for next run
+      const auto error = epee::net_utils::store_ssl_keys(m_net_server.get_ssl_context(), ssl_base_path);
+      if (error)
+        MFATAL("Failed to store HTTP SSL cert/key for " << (restricted ? "restricted " : "") << "RPC server: " << error.message());
+      return !bool(error);
+    }
+    return inited;
   }
   //------------------------------------------------------------------------------------------------------------------------------
   bool core_rpc_server::check_payment(const std::string &client_message, uint64_t payment, const std::string &rpc, bool same_ts, std::string &message, uint64_t &credits, std::string &top_hash)
@@ -367,7 +398,6 @@ namespace cryptonote
       message = "Client signature does not verify for " + rpc;
       return false;
     }
-    crypto::public_key local_client;
     if (!m_rpc_payment->pay(client, ts, payment, rpc, same_ts, credits))
     {
       message = CORE_RPC_STATUS_PAYMENT_REQUIRED;
@@ -1596,15 +1626,15 @@ namespace cryptonote
     {
       credentials = epee::net_utils::http::login(req.username, req.password);
     }
-    
-    if (set_bootstrap_daemon(req.address, credentials))
+
+    if (set_bootstrap_daemon(req.address, credentials, req.proxy))
     {
       res.status = CORE_RPC_STATUS_OK;
     }
     else
     {
       res.status = "Failed to set bootstrap daemon";
-    }    
+    }
 
     return true;
   }
@@ -1806,7 +1836,6 @@ namespace cryptonote
         return false;
       }
     }
-    uint64_t seed_height;
     crypto::hash seed_hash, next_seed_hash;
     if (!get_block_template(info.address, req.prev_block.empty() ? NULL : &prev_block, blob_reserve, reserved_offset, wdiff, res.height, res.expected_reward, b, res.seed_height, seed_hash, next_seed_hash, error_resp))
       return false;
@@ -1824,6 +1853,125 @@ namespace cryptonote
     res.prev_hash = string_tools::pod_to_hex(b.prev_id);
     res.blocktemplate_blob = string_tools::buff_to_hex_nodelimer(block_blob);
     res.blockhashing_blob =  string_tools::buff_to_hex_nodelimer(hashing_blob);
+    res.status = CORE_RPC_STATUS_OK;
+    return true;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  bool core_rpc_server::on_add_aux_pow(const COMMAND_RPC_ADD_AUX_POW::request& req, COMMAND_RPC_ADD_AUX_POW::response& res, epee::json_rpc::error& error_resp, const connection_context *ctx)
+  {
+    RPC_TRACKER(add_aux_pow);
+    bool r;
+    if (use_bootstrap_daemon_if_necessary<COMMAND_RPC_ADD_AUX_POW>(invoke_http_mode::JON_RPC, "add_aux_pow", req, res, r))
+      return r;
+
+    if (req.aux_pow.empty())
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "Empty aux pow hash vector";
+      return false;
+    }
+
+    crypto::hash merkle_root;
+    size_t merkle_tree_depth = 0;
+    std::vector<std::pair<crypto::hash, crypto::hash>> aux_pow;
+    std::vector<crypto::hash> aux_pow_raw;
+    aux_pow.reserve(req.aux_pow.size());
+    aux_pow_raw.reserve(req.aux_pow.size());
+    for (const auto &s: req.aux_pow)
+    {
+      aux_pow.push_back({});
+      if (!epee::string_tools::hex_to_pod(s.id, aux_pow.back().first))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "Invalid aux pow id";
+        return false;
+      }
+      if (!epee::string_tools::hex_to_pod(s.hash, aux_pow.back().second))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "Invalid aux pow hash";
+        return false;
+      }
+      aux_pow_raw.push_back(aux_pow.back().second);
+    }
+
+    size_t path_domain = 1;
+    while ((1u << path_domain) < aux_pow.size())
+      ++path_domain;
+    uint32_t nonce;
+    const uint32_t max_nonce = 65535;
+    bool collision = true;
+    for (nonce = 0; nonce <= max_nonce; ++nonce)
+    {
+      std::vector<bool> slots(aux_pow.size(), false);
+      collision = false;
+      for (size_t idx = 0; idx < aux_pow.size(); ++idx)
+      {
+        const uint32_t slot = cryptonote::get_aux_slot(aux_pow[idx].first, nonce, aux_pow.size());
+        if (slot >= aux_pow.size())
+        {
+          error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+          error_resp.message = "Computed slot is out of range";
+          return false;
+        }
+        if (slots[slot])
+        {
+          collision = true;
+          break;
+        }
+        slots[slot] = true;
+      }
+      if (!collision)
+        break;
+    }
+    if (collision)
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+      error_resp.message = "Failed to find a suitable nonce";
+      return false;
+    }
+
+    crypto::tree_hash((const char(*)[crypto::HASH_SIZE])aux_pow_raw.data(), aux_pow_raw.size(), merkle_root.data);
+    res.merkle_root = epee::string_tools::pod_to_hex(merkle_root);
+    res.merkle_tree_depth = cryptonote::encode_mm_depth(aux_pow.size(), nonce);
+
+    blobdata blocktemplate_blob;
+    if (!epee::string_tools::parse_hexstr_to_binbuff(req.blocktemplate_blob, blocktemplate_blob))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "Invalid blocktemplate_blob";
+      return false;
+    }
+
+    block b;
+    if (!parse_and_validate_block_from_blob(blocktemplate_blob, b))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_BLOCKBLOB;
+      error_resp.message = "Wrong blocktemplate_blob";
+      return false;
+    }
+
+    if (!remove_field_from_tx_extra(b.miner_tx.extra, typeid(cryptonote::tx_extra_merge_mining_tag)))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+      error_resp.message = "Error removing existing merkle root";
+      return false;
+    }
+    if (!add_mm_merkle_root_to_tx_extra(b.miner_tx.extra, merkle_root, merkle_tree_depth))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+      error_resp.message = "Error adding merkle root";
+      return false;
+    }
+    b.invalidate_hashes();
+    b.miner_tx.invalidate_hashes();
+
+    const blobdata block_blob = t_serializable_object_to_blob(b);
+    const blobdata hashing_blob = get_block_hashing_blob(b);
+
+    res.blocktemplate_blob = string_tools::buff_to_hex_nodelimer(block_blob);
+    res.blockhashing_blob = string_tools::buff_to_hex_nodelimer(hashing_blob);
+    res.aux_pow = req.aux_pow;
     res.status = CORE_RPC_STATUS_OK;
     return true;
   }
@@ -3346,6 +3494,12 @@ namespace cryptonote
   const command_line::arg_descriptor<std::string> core_rpc_server::arg_bootstrap_daemon_login = {
       "bootstrap-daemon-login"
     , "Specify username:password for the bootstrap daemon login"
+    , ""
+    };
+
+  const command_line::arg_descriptor<std::string> core_rpc_server::arg_bootstrap_daemon_proxy = {
+      "bootstrap-daemon-proxy"
+    , "<ip>:<port> socks proxy to use for bootstrap daemon connections"
     , ""
     };
 
